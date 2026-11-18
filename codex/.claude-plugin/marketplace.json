@@ -1,0 +1,23 @@
+{
+  "name": "qa-toolkit-codex",
+  "owner": {
+    "name": "ShlykovPavel"
+  },
+  "plugins": [
+    {
+      "name": "qa",
+      "source": "./qa",
+      "description": "Общее ядро QA-системы: проект, карта корня, база знаний, фазы задачи"
+    },
+    {
+      "name": "qa-manual",
+      "source": "./qa-manual",
+      "description": "Ручное тестирование: перепроверка задач, обход UI, заведение багов"
+    },
+    {
+      "name": "qa-auto",
+      "source": "./qa-auto",
+      "description": "Автотесты: API, фронтенд, мобилка, локаторы, ревью тестового слоя"
+    }
+  ]
+}

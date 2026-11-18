@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""qa-kb-slice — срез базы знаний по эндпоинту: что вики знает о нём сверх OpenAPI.
+
+Тест-спека автотестов пишется по срезу сваггера, а лимиты, переходы статусов, известные баги и
+оговорки стенда лежат в вики. Скрипт находит эндпоинт на страницах вики и отдаёт готовый JSON —
+агент не ищет и не пересчитывает (устройство — `docs/plugin/bridges-draft.md` мастерской).
+
+    qa-kb-slice --endpoint "POST /api/instructor/payouts" [--endpoint …]
+    qa-kb-slice --spec-slice _specs/Payouts.json --out _specs/Payouts_kb.json
+    qa-kb-slice --pages <папка страниц вики> …   # по умолчанию — `qa-paths pages`
+
+По каждому эндпоинту:
+- rules    — страницы флоу, домена, статуса и прочие: куски разделов (заголовок + абзац или пункт
+             списка), где эндпоинт упомянут; `to_be` — кусок про TO-BE, `method` — упомянут с методом;
+- cases    — `TC-NN · название` тест-страниц, в теле которых упомянут эндпоинт;
+- bugs     — заголовки страниц `type: status`, начинающиеся с номера (`### BUG-15 · …`, `## FE-24 · …`),
+             с группой над ними («Открытые» / «Закрытые», если есть) и номерами задач из раздела;
+- caveats  — раздел «Оговорки» тест-страниц, где эндпоинт встречается, целиком;
+- related  — страницы правил (флоу, домен, API, …), которые сам эндпоинт не называют, но к нему относятся:
+             `resource: true` — страница называет его ресурс (путь-основу `api/admin/tickets` для
+             `PUT /api/admin/tickets/{id}` или тот же путь с другим методом): так вики пишет сокращённые
+             пути (`PUT …/{id}`) и таблицы «основа + хвост» — их скрипт не разворачивает; остальные — на
+             них ссылаются `[[…]]` страницы, где эндпоинт упомянут, `refs` — сколько таких страниц (флоу
+             пишут правила словами и путь не называют — связь идёт через тест-кейсы). Порядок — порядок
+             чтения: сначала назвавшие ресурс, потом по числу ссылок. Ссылки отчётов не в счёт;
+             страницы, уже взятые кусками или багами, не повторяются;
+- history  — отчёты, заметки, источники: только пути — это история заходов и сырьё, а не правила.
+`empty` — эндпоинты, о которых в вики нет ничего: ни упоминаний, ни страниц ресурса.
+
+Сопоставление путей: параметры (`{id}`, `{userId}`, `:id`, число, uuid) — одно и то же, регистр не
+важен, хвостовой `/` и `?query` отбрасываются; путь без ведущего `/` (`GET api/admin/…`) — тот же путь;
+роли чередованием в сегменте (`api/{manager|admin}/…`, в таблице черта экранирована) — оба пути. Упоминание с
+другим методом — не он; без метода — засчитано (`method: false`). Путь без префикса `/api`
+засчитывается, только если рядом метод. Ресурс: упомянутый путь — начало пути эндпоинта, дальше идёт
+параметр либо один последний сегмент (и не больше двух); общий префикс роли (`api/admin`) — не ресурс.
+
+Коды возврата: 0 — готово; 2 — нет базы знаний или вход не разобрать, причина в stderr.
+Тест — `qa-toolkit/tests/test_qa_kb_slice.py`.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+HISTORY_TYPES = ("report", "note", "source", "meta")
+TYPE_ORDER = {"flow": 0, "domain": 1, "api": 2, "arch": 3, "role": 4, "product": 5, "status": 6}
+RESOURCE_TYPES = ("flow", "domain", "api", "arch", "role", "product")  # реестр багов целиком не читают
+MENTION = re.compile(
+    r"(?:\b(" + "|".join(METHODS) + r")\s+`?)?"
+    r"(?:(?<![\w/.:])(?=/)|(?<![\w/.:\-])(?=api/))"  # `/путь` или `api/путь` без ведущего `/`
+    r"(/?(?:[A-Za-z0-9_:.~\-/]|\{[^{}\s`]*\})*(?<=[A-Za-z0-9_}]))")
+ALTERNATION = re.compile(r"^\{([^{}|\\]+(?:\\?\|[^{}|\\]+)+)\}$")
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+LIST_ITEM = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s")
+CASE = re.compile(r"^(TC-\d+)\s*[·.:—–-]\s*(.+)$")
+ISSUE = re.compile(r"\b([A-Z][A-Z0-9]*-\d+)\b")
+BUG_HEADING = re.compile(r"^#{2,6}\s+([A-Z][A-Z0-9]*-\d+)\b")
+LINK = re.compile(r"\[\[([^\]|#]+)")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+API_PREFIX = re.compile(r"^(api|v\d+)$")
+FRAGMENT_MAX = 12
+CAVEATS_MAX = 20
+RESOURCE_TAIL_MAX = 2
+VARIANTS_MAX = 8
+
+
+class BadInput(Exception):
+    pass
+
+
+def path_key(path):
+    """Путь → кортеж сегментов: параметры и числа — `{}`, регистр и хвостовой `/` не важны."""
+    path = re.split(r"[?#]", path, maxsplit=1)[0].strip("/").lower()
+    segs = []
+    for seg in path.split("/"):
+        if not seg:
+            continue
+        if (seg.startswith("{") and seg.endswith("}")) or seg.startswith(":") or seg.isdigit() or UUID.match(seg):
+            seg = "{}"
+        segs.append(seg)
+    return tuple(segs)
+
+
+def path_keys(path):
+    """Путь из текста вики → ключи: чередование в сегменте (`{manager|admin}`) даёт по ключу на вариант."""
+    path = re.split(r"[?#]", path, maxsplit=1)[0].strip("/")
+    variants = [""]
+    for seg in path.split("/"):
+        alt = ALTERNATION.match(seg)
+        options = re.split(r"\\?\|", alt.group(1)) if alt else [seg]
+        variants = [f"{v}/{o}" for v in variants for o in options][:VARIANTS_MAX]
+    return [path_key(v) for v in variants]
+
+
+def strip_prefix(key):
+    i = 0
+    while i < len(key) and API_PREFIX.match(key[i]):
+        i += 1
+    return key[i:]
+
+
+def names_resource(k, key, said):
+    """Упомянутый путь `k` — ресурс эндпоинта `key`: его начало, а дальше параметр либо один сегмент."""
+    if k != key[:len(k)]:
+        if not said:
+            return False
+        k, key = strip_prefix(k), strip_prefix(key)
+        if k != key[:len(k)]:
+            return False
+    base, tail = strip_prefix(k), key[len(k):]
+    if not base or len(tail) > RESOURCE_TAIL_MAX:
+        return False
+    if not tail or tail[0] == "{}":
+        return True
+    return len(tail) == 1 and len(base) >= 2  # `api/admin` + `tickets` — префикс роли, не ресурс
+
+
+def parse_endpoint(text):
+    parts = text.split(None, 1)
+    if len(parts) != 2 or parts[0].upper() not in METHODS or not parts[1].startswith("/"):
+        raise BadInput(f"эндпоинт — строкой «МЕТОД /путь», а не «{text}»")
+    return parts[0].upper(), parts[1].strip()
+
+
+def endpoints_from_spec(path):
+    try:
+        spec = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise BadInput(f"срез спеки не прочитать: {path}: {e}")
+    out = []
+    for op in spec.get("operations") or []:  # срез openapi_slice.py
+        if isinstance(op, dict) and str(op.get("method", "")).upper() in METHODS and op.get("path"):
+            out.append((op["method"].upper(), op["path"]))
+    for p, item in (spec.get("paths") or {}).items():  # полная спека
+        if isinstance(item, dict):
+            out += [(m.upper(), p) for m in item if m.upper() in METHODS]
+    return out
+
+
+def pages_dir(explicit):
+    if explicit:
+        d = Path(explicit)
+        if not d.is_dir():
+            raise BadInput(f"база знаний: нет папки {d}")
+        return d.resolve()
+    qa_paths = Path(__file__).resolve().parent / "qa-paths"
+    res = subprocess.run([str(qa_paths), "pages"], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise BadInput("база знаний не найдена (qa-paths pages): " + res.stderr.strip())
+    return Path(res.stdout.strip()).resolve()
+
+
+def read_page(path):
+    """Строки без frontmatter и поля frontmatter (type, updated)."""
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    meta = {"links": {Path(t.strip()).name.removesuffix(".md") for t in LINK.findall(raw)}}
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                for line in lines[1:i]:
+                    k, sep, v = line.partition(":")
+                    if sep and not line.startswith((" ", "\t")):
+                        meta[k.strip()] = v.strip()
+                lines = [""] * (i + 1) + lines[i + 1:]  # номера строк сохраняются
+                break
+    return lines, meta
+
+
+def heading_stacks(lines):
+    """Для каждой строки — стек заголовков над ней: [(уровень, текст, номер строки)]."""
+    stack, out = [], []
+    for i, line in enumerate(lines):
+        m = HEADING.match(line)
+        if m:
+            level = len(m.group(1))
+            stack = [h for h in stack if h[0] < level] + [(level, line.strip(), i)]
+        out.append(list(stack))
+    return out
+
+
+def section_end(lines, start, level):
+    for j in range(start + 1, len(lines)):
+        m = HEADING.match(lines[j])
+        if m and len(m.group(1)) <= level:
+            return j
+    return len(lines)
+
+
+def fragment(lines, i):
+    """Абзац вокруг строки i, а в списке — только его пункт; не длиннее FRAGMENT_MAX строк."""
+    def stop(j):
+        return not lines[j].strip() or HEADING.match(lines[j])
+    start = i
+    while start > 0 and not LIST_ITEM.match(lines[start]) and not stop(start - 1):
+        start -= 1
+    end = i + 1
+    item = LIST_ITEM.match(lines[start])
+    while end < len(lines) and not stop(end):
+        nxt = LIST_ITEM.match(lines[end])
+        if nxt and (not item or len(nxt.group(1)) <= len(item.group(1))):
+            break
+        end += 1
+    if end - start > FRAGMENT_MAX:
+        start = max(start, i - FRAGMENT_MAX // 2)
+        end = min(end, start + FRAGMENT_MAX)
+    return start, end
+
+
+def mentions(line, endpoint):
+    """(упомянут ли эндпоинт: None — нет, иначе True/False — был ли рядом метод; назван ли его ресурс)."""
+    method, key = endpoint
+    found, resource = None, False
+    for m in MENTION.finditer(line):
+        said, path = m.group(1), m.group(2)
+        for k in path_keys(path):
+            exact = k == key or (said and strip_prefix(k) == strip_prefix(key) and strip_prefix(k))
+            if exact and (not said or said == method):
+                found = found or bool(said)
+            elif names_resource(k, key, said):
+                resource = True
+    return found, resource
+
+
+def page_status(lines):
+    for i, line in enumerate(lines):
+        m = HEADING.match(line)
+        if m and m.group(2).strip().lower() == "статус":
+            body = "\n".join(lines[i + 1:section_end(lines, i, len(m.group(1)))])
+            for mark in ("TO-BE", "AS-IS"):
+                if mark in body:
+                    return mark
+    return None
+
+
+def slice_page(rel, lines, meta, stacks, endpoint, acc):
+    kind = meta.get("type", "unknown")
+    hits, resource = [], False
+    for i, line in enumerate(lines):
+        found, res = mentions(line, endpoint)
+        if found is not None:
+            hits.append((i, found))
+        resource = resource or res
+    if not hits:
+        if resource and kind in RESOURCE_TYPES:
+            acc["resource"].add(rel)
+        return
+    acc["pages"].add(rel)
+    if kind in HISTORY_TYPES:
+        acc["history"].setdefault(kind, set()).add(rel)
+        return
+    for stem in meta["links"]:
+        acc["links"].setdefault(stem, set()).add(rel)
+    frags = {}
+    for i, with_method in hits:
+        stack = stacks[i]
+        if kind == "test":
+            case = next((CASE.match(re.sub(r"^#+\s*", "", h[1])) for h in reversed(stack)
+                         if CASE.match(re.sub(r"^#+\s*", "", h[1]))), None)
+            if case and (rel, case.group(1)) not in acc["case_keys"]:
+                acc["case_keys"].add((rel, case.group(1)))
+                acc["cases"].append({"page": rel, "id": case.group(1), "title": case.group(2).strip()})
+            continue
+        if kind == "status":
+            bug = next((h for h in reversed(stack) if BUG_HEADING.match(h[1])), None)
+            if bug:
+                if (rel, bug[2]) not in acc["bug_keys"]:
+                    acc["bug_keys"].add((rel, bug[2]))
+                    bug_id = BUG_HEADING.match(bug[1]).group(1)
+                    body = "\n".join(lines[bug[2]:section_end(lines, bug[2], bug[0])])
+                    tracker = []
+                    for t in ISSUE.findall(body):
+                        if t != bug_id and not t.startswith("TC-") and t not in tracker:
+                            tracker.append(t)
+                    group = next((h[1] for h in reversed(stack) if 2 <= h[0] < bug[0]), "")
+                    acc["bugs"].append({"page": rel, "id": bug_id, "group": re.sub(r"^#+\s*", "", group),
+                                        "heading": bug[1], "tracker": tracker})
+                continue
+        start, end = fragment(lines, i)
+        f = frags.get(start)
+        if f is None:
+            text = lines[start:end]
+            heading = stack[-1][1] if stack else ""
+            frags[start] = {"heading": heading, "lines": text, "method": with_method,
+                            "to_be": "TO-BE" in heading or any("TO-BE" in l for l in text)}
+        else:
+            f["method"] = f["method"] or with_method
+    if kind == "test":
+        for i, line in enumerate(lines):
+            m = HEADING.match(line)
+            if m and "оговорк" in m.group(2).lower():
+                body = [l for l in lines[i + 1:section_end(lines, i, len(m.group(1)))] if l.strip()]
+                acc["caveats"].append({"page": rel, "heading": line.strip(), "lines": body[:CAVEATS_MAX]})
+                break
+    if frags:
+        acc["rules"].append({"page": rel, "type": kind, "updated": meta.get("updated"),
+                             "status": page_status(lines),
+                             "fragments": [frags[k] for k in sorted(frags)]})
+
+
+def title_of(lines):
+    return next((m.group(2) for l in lines if (m := HEADING.match(l)) and len(m.group(1)) == 1), "")
+
+
+def related(acc, by_stem, by_rel):
+    """Страницы правил, назвавшие ресурс эндпоинта, и те, на которые ссылаются найденные страницы, —
+    кроме уже взятых кусками или багами."""
+    taken = {r["page"] for r in acc["rules"]} | {b["page"] for b in acc["bugs"]}
+    refs = {rel: 0 for rel in acc["resource"]}
+    for stem, sources in acc["links"].items():
+        page = by_stem.get(stem)
+        if page and page[2].get("type") in TYPE_ORDER and sources != {page[0]}:
+            refs[page[0]] = len(sources - {page[0]})
+    out = []
+    for rel, count in refs.items():
+        if rel in taken:
+            continue
+        _, lines, meta = by_rel[rel]
+        out.append({"page": rel, "type": meta["type"], "title": title_of(lines), "updated": meta.get("updated"),
+                    "status": page_status(lines), "refs": count, "resource": rel in acc["resource"]})
+    out.sort(key=lambda r: (not r["resource"], -r["refs"], TYPE_ORDER[r["type"]], r["page"]))
+    return out
+
+
+def build(pages, endpoints):
+    corpus, by_stem, by_rel = [], {}, {}
+    for path in sorted(pages.rglob("*.md")):
+        lines, meta = read_page(path)
+        rel = path.relative_to(pages).as_posix()
+        corpus.append((rel, lines, meta, heading_stacks(lines)))
+        by_stem.setdefault(path.stem, (rel, lines, meta))
+        by_rel[rel] = (rel, lines, meta)
+    result, all_pages, empty = [], set(), []
+    for method, path in endpoints:
+        acc = {"rules": [], "cases": [], "bugs": [], "caveats": [], "history": {}, "pages": set(),
+               "case_keys": set(), "bug_keys": set(), "links": {}, "resource": set()}
+        for rel, lines, meta, stacks in corpus:
+            slice_page(rel, lines, meta, stacks, (method, path_key(path)), acc)
+        acc["rules"].sort(key=lambda r: (TYPE_ORDER.get(r["type"], 9), r["page"]))
+        name = f"{method} {path}"
+        rel_pages = related(acc, by_stem, by_rel)
+        if not acc["pages"] and not rel_pages:
+            empty.append(name)
+        all_pages |= acc["pages"]
+        result.append({"endpoint": name, "pages": len(acc["pages"]), "rules": acc["rules"],
+                       "related": rel_pages,
+                       "cases": acc["cases"], "bugs": acc["bugs"], "caveats": acc["caveats"],
+                       "history": {k: sorted(v) for k, v in sorted(acc["history"].items())}})
+    totals = {"endpoints": len(result), "with_data": len(result) - len(empty), "pages": len(all_pages),
+              "cases": sum(len(e["cases"]) for e in result), "bugs": sum(len(e["bugs"]) for e in result),
+              "fragments": sum(len(r["fragments"]) for e in result for r in e["rules"]),
+              "related": sum(len(e["related"]) for e in result)}
+    return {"pages_dir": str(pages), "endpoints": result, "empty": empty, "totals": totals}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Срез базы знаний по эндпоинту — JSON для тест-спеки.")
+    ap.add_argument("--endpoint", action="append", default=[], help="«МЕТОД /путь», можно несколько")
+    ap.add_argument("--spec-slice", help="срез OpenAPI (openapi_slice.py --out, список operations) или полная спека (paths)")
+    ap.add_argument("--pages", help="папка страниц вики; по умолчанию — qa-paths pages")
+    ap.add_argument("--out", help="записать срез в файл; в stdout — путь и итоги")
+    args = ap.parse_args(argv)
+    try:
+        endpoints = [parse_endpoint(e) for e in args.endpoint]
+        if args.spec_slice:
+            endpoints += endpoints_from_spec(args.spec_slice)
+        if not endpoints:
+            raise BadInput("нужен хотя бы один эндпоинт: --endpoint «МЕТОД /путь» или --spec-slice")
+        pages = pages_dir(args.pages)
+    except BadInput as e:
+        print(f"qa-kb-slice: {e}", file=sys.stderr)
+        return 2
+    data = build(pages, endpoints)
+    text = json.dumps(data, ensure_ascii=False, indent=1)
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n", encoding="utf-8")
+        print(json.dumps({"out": str(out), "empty": data["empty"], "totals": data["totals"]},
+                         ensure_ascii=False))
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

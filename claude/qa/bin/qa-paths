@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""qa-paths — настоящие папки базы знаний проекта из маркера `.qa/project.yaml`.
+
+Скиллы пишут `wiki/` и `api_collection/` — это имена шаблона. У принятого проекта папки могут
+называться иначе (`shooting_wiki/`), их не переименовываем: маркер хранит в блоке `paths:` только
+отличия от шаблона. Устройство вики внутри (`raw/`, `wiki/`, `index.md`, `log.md`) у всех одно.
+
+    qa-paths            # все пути строками ключ=значение
+    qa-paths <ключ>     # одно значение — для подстановки в команду
+
+Ключи: kb (репо базы знаний), wiki, raw, pages (страницы вики), collection, collection_format.
+Пути абсолютные — агент меняет папку посреди работы, относительный путь тогда врёт.
+
+Где ищет базу знаний: от текущей папки вверх до маркера репо — репо `kb` сам и есть база, у
+`autotests` берётся сосед (`sibling:`); маркера выше нет — репо `kb` среди подпапок текущей
+папки (корень над репо).
+Тест — `qa-toolkit/tests/test_qa_paths.py`.
+
+Коды возврата: 0 — готово; 2 — базу знаний не найти однозначно или ключ неизвестен, причина в stderr.
+"""
+import re
+import sys
+from pathlib import Path
+
+MARKER = Path(".qa") / "project.yaml"
+DEFAULTS = {"wiki": "wiki", "collection": "api_collection", "collection_format": "bruno"}
+KEYS = ["kb", "wiki", "raw", "pages", "collection", "collection_format"]
+LINE = re.compile(r"^(\s*)(\w+):\s*(.*?)\s*(?:#.*)?$")
+
+
+class NotFound(Exception):
+    pass
+
+
+def read_marker(path):
+    """Верхний уровень маркера и его блок `paths:` (строки с отступом под ним)."""
+    top, paths, block = {}, {}, None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = LINE.match(line)
+        if not m:
+            continue
+        indent, key, value = m.groups()
+        if indent and block == "paths":
+            paths[key] = value
+            continue
+        block = key if not value else None
+        if value:
+            top[key] = value
+    return top, paths
+
+
+def find_kb(start):
+    # Вверх — только маркер самого репо: подпапки чужих родителей не смотрим (медленно, права
+    # доступа, чужая база знаний). Подпапки — только у текущей папки: это корень над репо.
+    for d in [start, *start.parents]:
+        if (d / MARKER).is_file():
+            return from_repo(d)
+    children = [c for c in sorted(start.iterdir()) if c.is_dir() and (c / MARKER).is_file()]
+    kbs = [c for c in children if read_marker(c / MARKER)[0].get("role") == "kb"]
+    if len(kbs) == 1:
+        return kbs[0]
+    if kbs:
+        raise NotFound(f"в {start} баз знаний: {len(kbs)} — {', '.join(c.name for c in kbs)}; "
+                       "какую взять, решает человек")
+    if children:
+        raise NotFound(f"в {start} нет репо базы знаний (маркер с role: kb) — досоздать его — /qa:init")
+    raise NotFound(f"ни в {start} и выше, ни в подпапках нет маркера {MARKER.as_posix()} — это не "
+                   "QA-проект, его разворачивает /qa:init")
+
+
+def from_repo(repo):
+    top, _ = read_marker(repo / MARKER)
+    if top.get("role") == "kb":
+        return repo
+    sibling = top.get("sibling", "none")
+    if sibling == "none":
+        raise NotFound(f"{repo.name}: в маркере нет соседа — репо базы знаний не связан с этим "
+                       "(досоздать его — /qa:init)")
+    kb = (repo / sibling).resolve()
+    if not (kb / MARKER).is_file() or read_marker(kb / MARKER)[0].get("role") != "kb":
+        raise NotFound(f"{repo.name}: сосед {sibling} — не репо базы знаний (нет маркера с role: kb)")
+    return kb
+
+
+def paths_of(kb):
+    _, own = read_marker(kb / MARKER)
+    names = {**DEFAULTS, **own}
+    wiki = kb / names["wiki"]
+    return {"kb": str(kb), "wiki": str(wiki), "raw": str(wiki / "raw"), "pages": str(wiki / "wiki"),
+            "collection": str(kb / names["collection"]), "collection_format": names["collection_format"]}
+
+
+def main(argv):
+    if len(argv) > 1 or (argv and argv[0] not in KEYS):
+        print(f"qa-paths: ключ {' '.join(argv)!r} неизвестен; есть: {', '.join(KEYS)}", file=sys.stderr)
+        return 2
+    try:
+        found = paths_of(find_kb(Path.cwd().resolve()))
+    except NotFound as e:
+        print(f"qa-paths: {e}", file=sys.stderr)
+        return 2
+    if argv:
+        print(found[argv[0]])
+    else:
+        print("\n".join(f"{k}={found[k]}" for k in KEYS))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

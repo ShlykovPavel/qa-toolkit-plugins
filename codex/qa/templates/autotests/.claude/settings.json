@@ -1,0 +1,33 @@
+{
+  "extraKnownMarketplaces": {
+    "qa-toolkit": {
+      "source": {
+        "source": "github",
+        "repo": "<владелец>/<репо каталога>",
+        "ref": "<ветка>"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "qa@qa-toolkit": true,
+    "qa-auto@qa-toolkit": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(make verify)",
+      "Bash(python3 -m compileall:*)",
+      "Bash(.venv/bin/python -m pytest --collect-only:*)",
+      "Bash(python3 -m pytest --collect-only:*)",
+      "Bash(openapi_slice.py:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(mkdir:*)",
+      "Bash(chmod +x:*)",
+      "mcp__playwright"
+    ]
+  }
+}

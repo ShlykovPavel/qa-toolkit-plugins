@@ -1,0 +1,16 @@
+{
+  "extraKnownMarketplaces": {
+    "qa-toolkit": {
+      "source": {
+        "source": "github",
+        "repo": "<владелец>/<репо каталога>",
+        "ref": "<ветка>"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "qa@qa-toolkit": true,
+    "qa-manual@qa-toolkit": true
+  }
+}

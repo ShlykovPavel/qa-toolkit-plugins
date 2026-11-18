@@ -1,0 +1,5 @@
+{
+  "_": "Разрешения корня сверх разрешений автотестов (их корень берёт из settings папки автотестов) — по ролям проекта: kb, autotests, both (обе). Кладёт qa-init.py, доводит /qa:sync.",
+  "kb": ["Bash(qa-paths:*)", "Bash(qa-task:*)"],
+  "both": ["Bash(qa-kb-slice:*)"]
+}

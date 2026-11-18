@@ -1,0 +1,82 @@
+# ПРИМЕР локального окружения для форка. Замените образы на свои.
+#
+# Рабочий минимум: одна БД + один сервис (соответствует BASE_URL / DB_PRIMARY
+# из .env). Второй сервис и вторая БД — закомментированные примеры, симметрично
+# закомментированным переменным в config.py / .env.example.
+
+networks:
+  app_network:
+    driver: bridge
+
+services:
+  # --- База данных (DB_PRIMARY) ---
+  primary-db:
+    image: postgres:latest
+    container_name: primary-db
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_USER: postgres
+      POSTGRES_DB: primary_db
+    ports:
+      - "5432:5432"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d primary_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --- Миграции (замените образ на свой) ---
+  primary-db-migrations:
+    image: your-registry/your-service/migrations:latest   # <-- замените
+    container_name: primary-db-migrations
+    depends_on:
+      primary-db:
+        condition: service_healthy
+    environment:
+      ConnectionStrings__Primary: "User ID=postgres;Password=mysecretpassword;Host=primary-db;Port=5432;Database=primary_db;"
+    networks:
+      - app_network
+    restart: on-failure
+
+  # --- Тестируемый сервис (BASE_URL) ---
+  app-service:
+    image: your-registry/your-service/app:latest          # <-- замените
+    container_name: app-service
+    restart: unless-stopped
+    ports:
+      - "9053:80"   # BASE_URL=http://localhost:9053
+    environment:
+      ConnectionStrings__Primary: "User ID=postgres;Password=mysecretpassword;Host=primary-db;Port=5432;Database=primary_db;"
+      URLS: "http://+:80"
+    depends_on:
+      - primary-db
+      - primary-db-migrations
+    networks:
+      - app_network
+
+  # --- Пример: второй сервис + вторая БД (DB_SECONDARY) ---
+  # secondary-db:
+  #   image: postgres:latest
+  #   container_name: secondary-db
+  #   restart: always
+  #   environment:
+  #     POSTGRES_PASSWORD: mysecretpassword
+  #     POSTGRES_USER: postgres
+  #     POSTGRES_DB: secondary_db
+  #   ports:
+  #     - "5435:5432"
+  #   networks:
+  #     - app_network
+  #
+  # app-second-service:
+  #   image: your-registry/your-second-service/app:latest
+  #   container_name: app-second-service
+  #   ports:
+  #     - "9055:80"   # BASE_URL_SECOND_SERVICE=http://localhost:9055
+  #   depends_on:
+  #     - secondary-db
+  #   networks:
+  #     - app_network

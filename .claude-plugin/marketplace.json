@@ -1,0 +1,24 @@
+{
+  "name": "qa-toolkit",
+  "owner": {
+    "name": "ShlykovPavel"
+  },
+  "description": "QA-обвязка: общее ядро, ручное тестирование с базой знаний, автотесты",
+  "plugins": [
+    {
+      "name": "qa",
+      "source": "./claude/qa",
+      "description": "Общее ядро QA-системы: проект, карта корня, база знаний, фазы задачи"
+    },
+    {
+      "name": "qa-manual",
+      "source": "./claude/qa-manual",
+      "description": "Ручное тестирование: перепроверка задач, обход UI, заведение багов"
+    },
+    {
+      "name": "qa-auto",
+      "source": "./claude/qa-auto",
+      "description": "Автотесты: API, фронтенд, мобилка, локаторы, ревью тестового слоя"
+    }
+  ]
+}

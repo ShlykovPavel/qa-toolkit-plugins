@@ -1,0 +1,8 @@
+# Опциональный довесок: playwright-ветка фронтенд-тестов
+# (выбор библиотеки — поле «Библиотека фронтенд-тестов» паспорта проекта).
+# Установка:
+#   pip install -r requirements-playwright.txt
+#   playwright install chromium
+# Selenium-ветке эти пакеты НЕ нужны — requirements.txt самодостаточен.
+playwright==1.61.0
+pytest-playwright==0.8.0

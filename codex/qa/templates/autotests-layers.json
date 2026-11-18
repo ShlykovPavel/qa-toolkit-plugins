@@ -1,0 +1,34 @@
+{
+  "_": "Карта слоёв шаблона автотестов для qa-init.py. API — ядро, в карте его нет: всё, что не попало сюда, копируется всегда. Путь с / на конце — папка целиком. Файл остаётся в проекте, только если включены все слои, под которые он подходит. Куски общих файлов размечаются строками «слой: <тег>» … «/слой» в комментарии своего формата (<!-- --> или #).",
+  "frontend": [
+    "frontend/",
+    "Tests/Frontend_tests/",
+    "docs/frontend.md",
+    ".claude/rules/frontend.md",
+    "docs/articles/playwright-mcp.md",
+    "docs/articles/selenium-or-playwright.md"
+  ],
+  "selenium": [
+    "frontend/driver_factory.py",
+    "frontend/front_keys/",
+    "Tests/Frontend_tests/conftest.py",
+    "Tests/Frontend_tests/ExamplePage/"
+  ],
+  "playwright": [
+    "frontend/pw_keys/",
+    "Tests/Frontend_tests/ExamplePagePW/",
+    "requirements-playwright.txt"
+  ],
+  "mobile": [
+    "Appium/",
+    "Tests/Mobile_tests/",
+    "docs/mobile.md",
+    ".claude/rules/mobile.md",
+    "docs/articles/appium-mcp.md",
+    "docs/articles/mobile-env-setup.md"
+  ],
+  "ui": [
+    "docs/locator-conventions.md",
+    "docs/apps-repos.md"
+  ]
+}

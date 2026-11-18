@@ -1,0 +1,5 @@
+.DS_Store
+# личные настройки Claude — у корня и у каждой папки проекта
+**/.claude/settings.local.json
+# план /qa:init — живёт до конца захода, в git не идёт
+/plan.json

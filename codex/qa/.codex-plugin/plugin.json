@@ -1,0 +1,11 @@
+{
+  "name": "qa",
+  "version": "0.2.34",
+  "description": "Общее ядро QA-системы: проект, карта корня, база знаний, фазы задачи",
+  "author": {
+    "name": "ShlykovPavel"
+  },
+  "repository": "https://github.com/ShlykovPavel/fullstack_autotests",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

@@ -1,0 +1,21 @@
+{
+  "adapter_version": 3,
+  "builder_sha256": "114f7908a8bfd1fb070715202d0281331fcc01cb7696b416c05aa9759c4164ab",
+  "plugins": {
+    "qa": {
+      "version": "0.2.34",
+      "sha256": "3c4027a4e3ccb0501170509bfdfb71869f33f8491dbf4788c618659c3ce688ab",
+      "built_sha256": "57248044afcb90a013e2b863b03ca0e40d4785fa42b0df13039047f80dfd19d6"
+    },
+    "qa-manual": {
+      "version": "0.1.5",
+      "sha256": "1cfcb7050713960fb73230f2dbccde9d53f515d4704feba0c964d7371f83c45c",
+      "built_sha256": "8ffac69b023176a6efa8f716539b99584e3bc4606319b49d3fe16ac8a0028906"
+    },
+    "qa-auto": {
+      "version": "0.1.17",
+      "sha256": "883e53204ee18a4610392c7ed8ae43d9810b23ed5a979a1ee12c23a7c83152b6",
+      "built_sha256": "ea49bac97d1ad6a75ffd06ede7020a465e41d2d00fc28e09cac53adec95d9e75"
+    }
+  }
+}

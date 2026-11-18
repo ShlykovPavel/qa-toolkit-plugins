@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Печатает имя и версию плагина qa из его plugin.json — проверка, что bin/ в PATH."""
+import json
+from pathlib import Path
+
+manifest = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
+data = json.loads(manifest.read_text(encoding="utf-8"))
+print(f"QA-HELLO-OK {data['name']} v{data['version']}")

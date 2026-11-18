@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""qa-task — карточка задачи: что за задача, что сделано, чего ждём, какой шаг следующий.
+
+Фазами задачу ведут скиллы; карточка — память о ней между сессиями, скиллами, репо и машинами
+(устройство — `docs/plugin/orchestrator-draft.md` мастерской). Один файл на задачу:
+`<база знаний>/tasks/<id>.md`, в git; после закрытия остаётся — это история, по ней находят
+смежные задачи. Шапку и списки ведёт скрипт, раздел «Заметки» и свои разделы — человек и агент.
+Трекера нет или он не открылся — суть задачи из сообщения человека кладётся в карточку дословно
+(`brief`): другого источника у следующей сессии не будет.
+
+    qa-task new <id> --title "<название>" [--tracker <адрес> …] [--route <тип>]
+    qa-task brief <id> <<'EOF'              # условие задачи со слов человека — текстом на вход,
+    <текст как есть>                        # ложится цитатой в раздел «Задача»; повтор — дописывает
+    EOF
+    qa-task title <id> "<название>"         # название уточнилось (прочли трекер, прошлый отчёт)
+    qa-task show <id>                       # карточка с номерами шагов и пунктов
+    qa-task list [--all]                    # открытые; --all — и закрытые
+    qa-task next                            # какую задачу продолжать и с чего
+    qa-task next <id> "<следующий шаг>"     # записать следующий шаг
+    qa-task find <слово> [<слово> …]        # все слова, по всем карточкам, закрытые тоже
+    qa-task progress [--days N]             # обзор: идут, ждут человека, ждут других, закрыты за N дней (7)
+
+    qa-task step <id> add "<что>" [--skill <скилл>]
+    qa-task step <id> done <N> ["<итог>"]
+    qa-task step <id> skip <N> "<почему>"
+    qa-task link <id> "<что>" <путь или адрес>
+    qa-task need <id> add "<что нужно от человека>"
+    qa-task need <id> given <N>
+    qa-task decide <id> "<решение>" [--assumed]   # --assumed — решил агент допущением
+    qa-task wait <id> "<кто — чего ждём>"         # «человек — …» в обзоре идёт отдельной группой
+    qa-task resume <id>
+    qa-task close <id> "<итог>"
+    qa-task reopen <id> "<следующий шаг>"         # та же задача вернулась
+
+`<id>` — латиница, цифры, дефис (`SHT-315` → `sht-315`; без трекера — слова: `login-429`). База знаний — `qa-paths kb`: работает из
+корня над репо, из базы знаний и из автотестов. Тест — `qa-toolkit/tests/test_qa_task.py`.
+
+Карточку правят руками (человек, Obsidian) и сливают в git с другой машины: свои ключи шапки и разделы
+скрипт оставляет как были; конфликт слияния git в карточке — отказ до разрешения руками; посторонний
+файл в `tasks/` обзор пропускает с предупреждением; одновременные вызовы по одной карточке идут по
+очереди (блокировка `tasks/.<id>.lock`, зависшая старше минуты снимается).
+
+Коды возврата: 0 — готово; 2 — база знаний не найдена, карточки нет или она уже есть, карточка
+закрыта, в ней конфликт слияния, номер не тот; причина в stderr, карточка не тронута.
+"""
+import argparse
+import datetime
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+FOLDER = "tasks"
+ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+HEAD_KEYS = ["id", "title", "tracker", "route", "status", "waiting", "next", "result",
+             "created", "updated", "machine"]
+SECTIONS = ["Задача", "Шаги", "Ссылки", "Нужно от человека", "Решения", "Ход", "Заметки"]
+LISTS = SECTIONS[1:-1]  # «Задача» и «Заметки» — свободный текст
+STATUS = {"open": "идёт", "waiting": "ждёт", "closed": "закрыта"}
+ITEM = re.compile(r"- \[(.)\] (.*)")
+MATCH_LINES = 3
+CONFLICT = re.compile(r"(<{7}|>{7})( .*)?")
+HEAD_LINE = re.compile(r"([A-Za-z_][\w-]*):(?: (.*))?")
+LOCK_WAIT, LOCK_STALE = 10, 60  # секунд: ждать чужой вызов; блокировка старше — от упавшего процесса
+HELD = []
+HUMAN = "человек"  # начало строки «ждёт» у задач, которые ждут самого человека
+
+
+class Refuse(Exception):
+    pass
+
+
+def today():
+    return os.environ.get("QA_TASK_TODAY") or datetime.date.today().isoformat()
+
+
+def machine():
+    return re.sub(r"\.local$", "", os.environ.get("QA_LAB_MACHINE") or socket.gethostname())
+
+
+def tasks_dir():
+    qa_paths = Path(__file__).resolve().parent / "qa-paths"
+    res = subprocess.run([str(qa_paths), "kb"], capture_output=True, text=True)
+    if res.returncode:
+        raise Refuse("база знаний не найдена — " + res.stderr.strip().removeprefix("qa-paths: "))
+    return Path(res.stdout.strip()) / FOLDER
+
+
+def task_id(raw):
+    tid = raw.strip().lower()
+    if not ID.fullmatch(tid):
+        raise Refuse(f"id {raw!r} не годится: латиница, цифры и дефис, например sht-315")
+    return tid
+
+
+def one_line(text):
+    return " ".join(text.split())
+
+
+def trimmed(lines):
+    """Строки без пустых по краям."""
+    body = list(lines)
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    return body
+
+
+class Card:
+    """Шапка — словарь; до первого раздела — строки как есть; разделы — заголовок и строки."""
+
+    def __init__(self, path, head, intro, sections, raw_head=()):
+        self.path, self.head, self.intro, self.sections = path, head, intro, sections
+        self.raw_head = list(raw_head)  # строки шапки как в файле: чужие ключи пишутся обратно как были
+
+    @classmethod
+    def blank(cls, path, head):
+        return cls(path, head, [f"# {head['id']} · {head['title']}"], [[name, []] for name in SECTIONS])
+
+    @classmethod
+    def read(cls, path):
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+        if any(CONFLICT.fullmatch(line) for line in lines):
+            raise Refuse(f"{path}: в карточке конфликт слияния git (строки <<<<<<< и >>>>>>>) — разреши его "
+                         "руками и закоммить, потом повтори")
+        if not lines or lines[0] != "---" or "---" not in lines[1:]:
+            raise Refuse(f"{path}: шапка карточки не читается (нет блока между строками ---)")
+        end = lines.index("---", 1)
+        head = {}
+        for line in lines[1:end]:
+            m = HEAD_LINE.fullmatch(line)
+            if m and m.group(2) is not None:
+                head[m.group(1)] = m.group(2)
+        intro, sections, fence = [], [], False
+        for line in lines[end + 1:]:
+            if line.startswith("```"):
+                fence = not fence
+            if line.startswith("## ") and not fence:
+                sections.append([line[3:].strip(), []])
+            else:
+                (sections[-1][1] if sections else intro).append(line)
+        return cls(path, head, intro, sections, lines[1:end])
+
+    def lines(self, name):
+        for title, lines in self.sections:
+            if title == name:
+                return lines
+        # раздела нет (стёрли руками, карточка старше раздела) — «Задача» первой, прочие — перед заметками
+        at = 0 if name == SECTIONS[0] else next(
+            (i for i, s in enumerate(self.sections) if s[0] == "Заметки"), len(self.sections))
+        self.sections.insert(at, [name, []])
+        return self.sections[at][1]
+
+    def items(self, name):
+        return [line for line in self.lines(name) if line.startswith("- ")]
+
+    def add(self, name, line):
+        lines = self.lines(name)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines.append(line)
+
+    def replace(self, name, number, line):
+        lines = self.lines(name)
+        at = [i for i, text in enumerate(lines) if text.startswith("- ")][number - 1]
+        lines[at] = line
+
+    def log(self, what):
+        self.add("Ход", f"- {today()} {what} ({machine()})")
+
+    def write(self):
+        self.head["updated"], self.head["machine"] = today(), machine()
+        head, seen = [], set()
+        for line in self.raw_head:
+            m = HEAD_LINE.fullmatch(line)
+            key = m.group(1) if m else None
+            if key in HEAD_KEYS:
+                if key not in seen and self.head.get(key):
+                    head.append(f"{key}: {self.head[key]}")
+                seen.add(key)
+            else:
+                head.append(line)
+        head += [f"{k}: {self.head[k]}" for k in HEAD_KEYS if k not in seen and self.head.get(k)]
+        out = ["---", *head, "---", *trimmed(self.intro), ""]
+        for title, lines in self.sections:
+            body = trimmed(lines)
+            keep_gap = title not in LISTS and body
+            out += [f"## {title}", *([""] if keep_gap else []), *body, ""]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(f".{self.path.stem}.{os.getpid()}.tmp")
+        tmp.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
+        tmp.replace(self.path)
+
+    def state(self):
+        status = self.head.get("status", "open")
+        if status == "waiting":
+            return f"ждёт: {self.head.get('waiting', '?')}"
+        if status == "closed":
+            return f"закрыта: {self.head.get('result', '?')}"
+        return STATUS.get(status, status)
+
+
+def lock(folder, tid):
+    """Вызовы по одной карточке — по очереди: иначе второй перечитает её до записи первого и затрёт."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f".{tid}.lock"
+    deadline = time.monotonic() + LOCK_WAIT
+    while True:
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            HELD.append(path)
+            return
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > LOCK_STALE:
+                    path.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() > deadline:
+                raise Refuse(f"карточка {tid} занята другим вызовом qa-task ({path}) — повтори позже")
+            time.sleep(0.05)
+
+
+def release():
+    while HELD:
+        HELD.pop().unlink(missing_ok=True)
+
+
+def all_cards(folder):
+    cards = []
+    for path in sorted(folder.glob("*.md")) if folder.is_dir() else []:
+        try:
+            cards.append(Card.read(path))
+        except Refuse as e:  # чужой файл или битая карточка не должны прятать остальные
+            print(f"qa-task: пропущен {path.name}: {e}", file=sys.stderr)
+    # свежие первыми; при равной дате — по id, чтобы порядок не плавал
+    cards.sort(key=lambda c: c.head.get("id", c.path.stem))
+    cards.sort(key=lambda c: c.head.get("updated", ""), reverse=True)
+    return cards
+
+
+def load(folder, raw, *, writable=False, closed_ok=False):
+    tid = task_id(raw)
+    path = folder / f"{tid}.md"
+    if not path.is_file():
+        known = ", ".join(c.head.get("id", c.path.stem) for c in all_cards(folder)) or "нет ни одной"
+        raise Refuse(f"карточки {tid} нет; есть: {known}")
+    if writable:
+        lock(folder, tid)
+    card = Card.read(path)
+    if writable and not closed_ok and card.head.get("status") == "closed":
+        raise Refuse(f"карточка {tid} закрыта ({card.head.get('result', '?')}) — задача вернулась: "
+                     f"qa-task reopen {tid} \"<следующий шаг>\"")
+    return card
+
+
+def numbered(card, name, raw, what):
+    items = card.items(name)
+    if not raw.isdigit() or not 1 <= int(raw) <= len(items):
+        raise Refuse(f"{what} {raw!r} нет: в карточке их {len(items)} — номера смотри в qa-task show")
+    return int(raw), items[int(raw) - 1]
+
+
+def row(card):
+    line = f"{card.head.get('id', card.path.stem)} · {card.state()} · {card.head.get('title', '')}"
+    line += f" · {card.head.get('updated', '?')} ({card.head.get('machine', '?')})"
+    if card.head.get("next"):
+        line += f" · дальше: {card.head['next']}"
+    return line
+
+
+def show(card):
+    h = card.head
+    out = [f"{h.get('id', card.path.stem)} · {card.state()} · {h.get('title', '')}"]
+    for key, label in (("tracker", "трекер"), ("route", "маршрут"), ("next", "следующий шаг")):
+        if h.get(key):
+            out.append(f"{label}: {h[key]}")
+    out.append(f"обновлена: {h.get('updated', '?')} ({h.get('machine', '?')})")
+    for title, lines in card.sections:
+        body = [line for line in lines if line.strip()]
+        if not body:
+            continue
+        out += ["", f"{title}:"]
+        if title in ("Шаги", "Нужно от человека"):
+            n = 0
+            for line in body:
+                if line.startswith("- "):
+                    n += 1
+                    out.append(f"  {n}. {line[2:]}")
+                else:
+                    out.append(f"  {line}")
+        else:
+            out += [f"  {line}" for line in body]
+    out += ["", f"карточка: {card.path}"]
+    return "\n".join(out)
+
+
+# --- команды
+
+def cmd_new(folder, a):
+    tid = task_id(a.id)
+    path = folder / f"{tid}.md"
+    lock(folder, tid)
+    if path.exists():
+        raise Refuse(f"карточка {tid} уже есть ({Card.read(path).state()}) — смотри qa-task show {tid}; "
+                     f"закрытая задача вернулась — qa-task reopen {tid} \"<следующий шаг>\"")
+    head = {"id": tid, "title": one_line(a.title), "tracker": ", ".join(a.tracker or []),
+            "route": a.route or "", "status": "open", "created": today()}
+    card = Card.blank(path, head)
+    card.log("заведена")
+    card.write()
+    return f"карточка заведена: {path}"
+
+
+def cmd_brief(folder, a):
+    card = load(folder, a.id, writable=True)
+    text = trimmed(sys.stdin.read().splitlines())
+    if not text:
+        raise Refuse("текст задачи пуст: передай его на вход — qa-task brief <id> <<'EOF' … EOF")
+    # цитатой: строки человека вида «## …» и «---» не должны читаться как разделы и шапка карточки
+    quoted = [f"> {line.rstrip()}" if line.strip() else ">" for line in text]
+    lines = card.lines("Задача")
+    lines[:] = trimmed(lines)
+    lines += ([""] if lines else []) + [f"_{today()}, со слов человека:_", *quoted]
+    card.write()
+    return f"{card.head['id']}: условие задачи записано, строк: {len(quoted)}"
+
+
+def cmd_title(folder, a):
+    card = load(folder, a.id, writable=True)
+    old, card.head["title"] = card.head.get("title", ""), one_line(a.text)
+    heading = f"# {card.head['id']} · "
+    card.intro = [f"{heading}{card.head['title']}" if line == f"{heading}{old}" else line for line in card.intro]
+    card.write()
+    return f"{card.head['id']}: название — {card.head['title']}"
+
+
+def cmd_show(folder, a):
+    return show(load(folder, a.id))
+
+
+def cmd_list(folder, a):
+    cards = all_cards(folder)
+    opened = [c for c in cards if c.head.get("status") != "closed"]
+    shown = cards if a.all else opened
+    if shown:
+        return "\n".join(row(c) for c in shown)
+    closed = len(cards) - len(opened)
+    return "открытых задач нет" + (f" (закрытых: {closed} — list --all)" if closed else "")
+
+
+def cmd_next(folder, a):
+    if a.id:
+        if not a.text:
+            raise Refuse("следующий шаг не назван: qa-task next <id> \"<следующий шаг>\"")
+        card = load(folder, a.id, writable=True)
+        card.head["next"] = one_line(a.text)
+        card.write()
+        return f"{card.head['id']}: следующий шаг записан"
+    cards = [c for c in all_cards(folder) if c.head.get("status") != "closed"]
+    running = [c for c in cards if c.head.get("status") != "waiting"]
+    waiting = [c for c in cards if c.head.get("status") == "waiting"]
+    if not cards:
+        return "открытых задач нет"
+    tail = [f"ждут: {len(waiting)}", *(f"  {row(c)}" for c in waiting)] if waiting else []
+    if len(running) == 1:
+        return "\n".join([show(running[0]), *([""] + tail if tail else [])])
+    if not running:
+        return "\n".join(["идущих задач нет", *tail])
+    return "\n".join([f"идут: {len(running)} — какую продолжать — решает человек",
+                      *(f"  {row(c)}" for c in running), *tail])
+
+
+def cmd_progress(folder, a):
+    cards = all_cards(folder)
+    if not cards:
+        return "задач нет"
+    since = (datetime.date.fromisoformat(today()) - datetime.timedelta(days=a.days)).isoformat()
+    running, human, others, closed, older = [], [], [], [], 0
+    for c in cards:
+        h = c.head
+        name = f"{h.get('id', c.path.stem)} · {h.get('title', '')}"
+        if h.get("status") == "closed":
+            if h.get("updated", "") >= since:
+                closed.append(f"{name} · {h.get('result', '?')} · {h.get('updated', '?')}")
+            else:
+                older += 1
+        elif h.get("status") == "waiting":
+            who, _, what = h.get("waiting", "?").partition(" — ")
+            mine = who.strip().lower().startswith(HUMAN)
+            (human if mine else others).append(
+                f"{name} · {what if mine and what else h.get('waiting', '?')} · с {h.get('updated', '?')}")
+        else:
+            step = f"дальше: {h['next']}" if h.get("next") else "следующий шаг не записан"
+            running.append(f"{name} · {step} · {h.get('updated', '?')} ({h.get('machine', '?')})")
+    out = []
+    for title, rows in (("ждут человека", human), ("идут", running), ("ждут других", others),
+                        (f"закрыты за {a.days} дней", closed)):
+        if rows:
+            out += [f"{title}: {len(rows)}", *(f"  {row}" for row in rows)]
+    if older:
+        out.append(f"закрытых раньше: {older} — qa-task list --all")
+    return "\n".join(out)
+
+
+def cmd_find(folder, a):
+    words = [w.lower() for w in a.words]
+    out = []
+    for card in all_cards(folder):
+        body = [*card.intro, *(line for title, lines in card.sections for line in lines)]
+        low = "\n".join([*card.raw_head, *body]).lower()
+        if not all(w in low for w in words):
+            continue
+        out.append(f"{card.head.get('id', card.path.stem)} · {card.state()} · {card.head.get('title', '')}")
+        hits = [line.strip() for line in body if any(w in line.lower() for w in words) and not line.startswith("#")]
+        out += [f"  {line.removeprefix('- ').removeprefix('> ')}" for line in hits[:MATCH_LINES]]
+        out.append(f"  карточка: {card.path}")
+    return "\n".join(out) if out else "ничего не найдено"
+
+
+def cmd_step(folder, a):
+    card = load(folder, a.id, writable=True)
+    if a.action == "add":
+        if not a.args:
+            raise Refuse("шаг не назван: qa-task step <id> add \"<что>\" [--skill <скилл>]")
+        text = one_line(" ".join(a.args)) + (f" · {a.skill}" if a.skill else "")
+        card.add("Шаги", f"- [ ] {text}")
+        card.write()
+        return f"{card.head['id']}: шаг {len(card.items('Шаги'))} добавлен"
+    if not a.args:
+        raise Refuse(f"номер шага не назван: qa-task step <id> {a.action} <N> …")
+    n, line = numbered(card, "Шаги", a.args[0], "шага")
+    note = one_line(" ".join(a.args[1:]))
+    text = ITEM.fullmatch(line).group(2) if ITEM.fullmatch(line) else line[2:]
+    if a.action == "skip":
+        if not note:
+            raise Refuse("пропуск шага — с причиной: qa-task step <id> skip <N> \"<почему>\"")
+        card.replace("Шаги", n, f"- [-] {text} — пропущен: {note} ({today()})")
+    else:
+        card.replace("Шаги", n, f"- [x] {text}" + (f" — {note}" if note else "") + f" ({today()})")
+    card.write()
+    return f"{card.head['id']}: шаг {n} — {'пропущен' if a.action == 'skip' else 'сделан'}"
+
+
+def cmd_link(folder, a):
+    card = load(folder, a.id, writable=True)
+    card.add("Ссылки", f"- {one_line(a.what)}: {a.target}")
+    card.write()
+    return f"{card.head['id']}: ссылка записана"
+
+
+def cmd_need(folder, a):
+    card = load(folder, a.id, writable=True)
+    if a.action == "add":
+        card.add("Нужно от человека", f"- [ ] {one_line(a.arg)}")
+        card.write()
+        return f"{card.head['id']}: пункт {len(card.items('Нужно от человека'))} добавлен"
+    n, line = numbered(card, "Нужно от человека", a.arg, "пункта")
+    text = ITEM.fullmatch(line).group(2) if ITEM.fullmatch(line) else line[2:]
+    card.replace("Нужно от человека", n, f"- [x] {text}")
+    card.write()
+    return f"{card.head['id']}: пункт {n} — дано"
+
+
+def cmd_decide(folder, a):
+    card = load(folder, a.id, writable=True)
+    who = "допущение" if a.assumed else "человек"
+    card.add("Решения", f"- {today()} {who}: {one_line(a.text)}")
+    card.write()
+    return f"{card.head['id']}: решение записано"
+
+
+def cmd_wait(folder, a):
+    card = load(folder, a.id, writable=True)
+    card.head["status"], card.head["waiting"] = "waiting", one_line(a.text)
+    card.log(f"ждёт: {card.head['waiting']}")
+    card.write()
+    return f"{card.head['id']}: ждёт — {card.head['waiting']}"
+
+
+def cmd_resume(folder, a):
+    card = load(folder, a.id, writable=True)
+    card.head["status"] = "open"
+    card.head.pop("waiting", None)
+    card.log("идёт снова")
+    card.write()
+    return f"{card.head['id']}: идёт снова"
+
+
+def cmd_close(folder, a):
+    card = load(folder, a.id, writable=True)
+    card.head["status"], card.head["result"] = "closed", one_line(a.text)
+    card.head.pop("waiting", None)
+    card.head.pop("next", None)
+    card.log(f"закрыта: {card.head['result']}")
+    card.write()
+    return f"{card.head['id']}: закрыта"
+
+
+def cmd_reopen(folder, a):
+    card = load(folder, a.id, writable=True, closed_ok=True)
+    if card.head.get("status") != "closed":
+        raise Refuse(f"карточка {card.head['id']} и так открыта ({card.state()})")
+    card.head["status"], card.head["next"] = "open", one_line(a.text)
+    card.head.pop("result", None)  # прошлый итог остаётся строкой хода
+    card.log("открыта снова")
+    card.write()
+    return f"{card.head['id']}: открыта снова"
+
+
+def parser():
+    ap = argparse.ArgumentParser(prog="qa-task", description="Карточка задачи в базе знаний.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new")
+    p.add_argument("id")
+    p.add_argument("--title", required=True)
+    p.add_argument("--tracker", action="append")
+    p.add_argument("--route")
+    sub.add_parser("brief").add_argument("id")
+    sub.add_parser("show").add_argument("id")
+    sub.add_parser("list").add_argument("--all", action="store_true")
+    p = sub.add_parser("next")
+    p.add_argument("id", nargs="?")
+    p.add_argument("text", nargs="?")
+    sub.add_parser("find").add_argument("words", nargs="+")
+    sub.add_parser("progress").add_argument("--days", type=int, default=7)
+    p = sub.add_parser("step")
+    p.add_argument("id")
+    p.add_argument("action", choices=["add", "done", "skip"])
+    p.add_argument("args", nargs="*")
+    p.add_argument("--skill")
+    p = sub.add_parser("link")
+    p.add_argument("id")
+    p.add_argument("what")
+    p.add_argument("target")
+    p = sub.add_parser("need")
+    p.add_argument("id")
+    p.add_argument("action", choices=["add", "given"])
+    p.add_argument("arg")
+    p = sub.add_parser("decide")
+    p.add_argument("id")
+    p.add_argument("text")
+    p.add_argument("--assumed", action="store_true")
+    for name in ("title", "wait", "close", "reopen"):
+        p = sub.add_parser(name)
+        p.add_argument("id")
+        p.add_argument("text")
+    sub.add_parser("resume").add_argument("id")
+    return ap
+
+
+def main(argv=None):
+    a = parser().parse_args(argv)
+    try:
+        print(globals()[f"cmd_{a.cmd}"](tasks_dir(), a))
+    except Refuse as e:
+        print(f"qa-task: {e}", file=sys.stderr)
+        return 2
+    finally:
+        release()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

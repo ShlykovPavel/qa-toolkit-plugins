@@ -1,0 +1,11 @@
+{
+  "name": "qa-auto",
+  "version": "0.1.17",
+  "description": "Автотесты: API, фронтенд, мобилка, локаторы, ревью тестового слоя",
+  "author": {
+    "name": "ShlykovPavel"
+  },
+  "repository": "https://github.com/ShlykovPavel/fullstack_autotests",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

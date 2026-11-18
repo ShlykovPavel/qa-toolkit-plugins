@@ -1,0 +1,11 @@
+{
+  "_comment": "ПРИМЕР файла локализации: тексты приложения для проверок assert_text(element, ключ). Заполните ключами своего приложения; путь к файлу задаётся env-переменной LOCALIZATION_FILE_PATH.",
+  "locale": "en_EN",
+  "ok": "Ok",
+  "cancel": "Cancel",
+  "save": "Save",
+  "delete": "Remove",
+  "error": "Error",
+  "example_feature_title": "Example Feature",
+  "error_field_required": "Field is required"
+}

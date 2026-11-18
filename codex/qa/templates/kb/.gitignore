@@ -1,0 +1,37 @@
+### macOS
+# Finder metadata
+.DS_Store
+
+# Thumbnails
+._*
+
+# Custom folder icons
+Icon
+
+# Volume root files
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+### Obsidian
+# Состояние окон и вкладок: машинное, у каждого своё, и тянет за собой
+# названия открытых файлов — в том числе из других проектов.
+**/.obsidian/workspace.json
+
+### Python
+# Байткод скриптов скиллов: появляется от любого запуска, машинный и локальный.
+__pycache__/
+*.pyc
+
+### Оснащение машины
+# Маркер preflight: исход проверки инструментов на КОНКРЕТНОЙ машине. Машинно-локален по
+# смыслу — в git он немедленно устареет и начнёт врать другой машине.
+.preflight-ok
+
+### Заходы
+# Сырьё прогонов: дампы, тела ответов, кадры. Живёт локально, в базу уезжают выводы.
+runs/

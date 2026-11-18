@@ -1,0 +1,84 @@
+# .gitlab-ci.yml — CI-заготовка шаблона. Живого стенда в шаблоне НЕТ:
+# зелёный из коробки только verify; всё стендовое включается в форке
+# переменной STAND_AVAILABLE=true (Settings → CI/CD → Variables).
+#
+# Секреты и параметры стенда — ИМЕНА из config.py (BASE_URL, DB_PRIMARY,
+# ADMIN_EMAIL, ADMIN_PASSWORD, REQUEST_TIMEOUT, ...), значения задаются
+# в CI-переменных форка (masked/protected), НЕ в этом файле и не в repo.
+#
+# Smoke-джоб ВЫЗЫВАЕТ ./run_big_smoke_tests.sh — единый источник правды
+# прогона и Allure-отчёта (не дублировать его логику inline).
+# Образ для smoke/regression должен содержать Java + Allure CLI —
+# соберите свой или добавьте установку в before_script форка.
+
+image: python:3.12
+
+stages:
+  - verify
+  - smoke
+  - regression
+  - report
+
+.deps: &deps
+  - python -m venv .venv
+  - .venv/bin/pip install --quiet -r requirements.txt
+  - . .venv/bin/activate
+
+# Гоняется и в шаблоне: синтаксис + импорты + сбор фикстур, стенд не нужен
+verify:
+  stage: verify
+  before_script: *deps
+  script:
+    - make verify
+
+# Тесты скриптов обвязки (preflight, дамп-скрипты, гейты) — стенд и устройство
+# не нужны. Отдельным джобом: падение скрипта не маскируется под «сломан verify»
+scripts-tests:
+  stage: verify
+  before_script: *deps
+  script:
+    - pytest -q scripts/
+
+# На MR при доступном стенде; скрипт сам соберёт single-file Allure-отчёт
+smoke:
+  stage: smoke
+  rules:
+    - if: '$STAND_AVAILABLE == "true" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+  before_script: *deps
+  script:
+    - ./run_big_smoke_tests.sh
+  artifacts:
+    when: always
+    paths:
+      - allure-report/
+      - logs/
+    expire_in: 1 week
+
+# По расписанию (Pipeline schedules форка) при доступном стенде
+regression:
+  stage: regression
+  rules:
+    - if: '$STAND_AVAILABLE == "true" && $CI_PIPELINE_SOURCE == "schedule"'
+  before_script: *deps
+  script:
+    - pytest -v -m regression --alluredir=testresults/ Tests/Regression_tests
+  artifacts:
+    when: always
+    paths:
+      - testresults/
+      - logs/
+    expire_in: 1 week
+
+# Отчёт по регрессии из testresults/ предыдущей стадии
+report:
+  stage: report
+  rules:
+    - if: '$STAND_AVAILABLE == "true" && $CI_PIPELINE_SOURCE == "schedule"'
+  needs: [regression]
+  script:
+    - allure generate --single-file testresults/ -o allure-report --clean
+  artifacts:
+    when: always
+    paths:
+      - allure-report/
+    expire_in: 1 week

@@ -1,0 +1,7 @@
+{
+  "name": "qa-manual",
+  "version": "0.1.5",
+  "description": "Ручное тестирование: перепроверка задач, обход UI, заведение багов",
+  "author": { "name": "ShlykovPavel" },
+  "repository": "https://github.com/ShlykovPavel/fullstack_autotests"
+}
